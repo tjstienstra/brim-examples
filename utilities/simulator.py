@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 from scipy.integrate import solve_ivp
 from scipy.optimize import fsolve
-from sympy import Basic, Function, lambdify
+from sympy import Basic, Dummy, Function, ImmutableMatrix, lambdify
 from sympy.physics.mechanics import (
     KanesMethod,
     System,
@@ -36,11 +36,17 @@ class Simulator:
         self._c, self._c_funcs = (), ()
         self._eval_configuration_constraints = None
         self._eval_velocity_constraints = None
+        self._eval_ud_dep_via_constraints = None
         self._eval_eoms_matrices = None
         self._initialized = False
         self._n_qind, self._n_qdep, self._n_q, self._n_uind, self._n_udep, self._n_u = (
             None, None, None, None, None, None)
         self._n_x = None
+        self._solve_dependent_speeds_in_dae = True
+        try:
+            pass
+        except ImportError:
+            self._solve_dependent_speeds_in_dae = False
 
     @property
     def t(self) -> npt.NDArray[np.float64]:
@@ -123,6 +129,24 @@ class Simulator:
             else:
                 self.solve_initial_conditions()
 
+    @property
+    def solve_dependent_speeds_in_dae(self) -> bool:
+        """Whether to solve dependent speeds in the DAE.
+
+        Explanation
+        -----------
+        If True, the dependent speeds are solved during the initialization phase, such
+        that the DAE can evaluate . If False, the
+        """
+        return self._solve_dependent_speeds_in_dae
+
+    @solve_dependent_speeds_in_dae.setter
+    def solve_dependent_speeds_in_dae(self, solve_dependent_speeds_in_dae: bool):
+        value = bool(solve_dependent_speeds_in_dae)
+        if value and not self._solve_dependent_speeds_in_dae:
+            self._initialized = False
+        self._solve_dependent_speeds_in_dae = bool(solve_dependent_speeds_in_dae)
+
     def _eval_eoms_reshaped(
             self, t: float, x: npt.NDArray[np.float64]
     ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
@@ -154,6 +178,8 @@ class Simulator:
             nb.float64[::1], nb.float64[::1], nb.float64[::1])
         vel_signature = nb.types.List(nb.float64)(
             nb.float64[::1], nb.float64[::1], nb.float64[::1], nb.float64[::1])
+        ud_dep_signature = nb.types.List(nb.float64)(
+            nb.float64, nb.float64[::1], nb.float64[::1], nb.float64[::1])
         eoms_signature = nb.types.Tuple([nb.float64[:, ::1], nb.float64[:, ::1]])(
                     nb.float64, nb.float64[::1], nb.float64[::1], nb.float64[::1])
         # Compile the functions
@@ -176,6 +202,17 @@ class Simulator:
             except Exception as e:  # pragma: no cover
                 msg = (f"Could not compile lambdified velocity constraint. "
                        f"Execution raised the following error:\n{e}")
+                print(msg)  # noqa: T201
+        if self.solve_dependent_speeds_in_dae:
+            try:
+                eval_ud_dep = nb.njit(ud_dep_signature, **kwargs)(
+                    self._eval_velocity_constraints)
+                eval_ud_dep(0., x, np.zeros_like(u_dep), self._p_vals)
+                self._eval_ud_dep_via_constraints = eval_ud_dep
+            except Exception as e:  # pragma: no cover
+                msg = (f"Could not compile lambdified solution of the derivative of the"
+                       f" generalized speeds. constraint. Execution raised the "
+                       f"following error:\n{e}")
                 print(msg)  # noqa: T201
         try:
             eval_eoms_nb = nb.njit(eoms_signature, **kwargs)(self._eval_eoms_matrices)
@@ -283,6 +320,15 @@ class Simulator:
         self._eval_velocity_constraints = lambdify(
             (self.system.u_dep, self.system.q, self.system.u_ind, self._p),
             velocity_constraints[:], cse=True)
+        if self.solve_dependent_speeds_in_dae:
+            ud_ind = ImmutableMatrix([Dummy() for _ in self.system.u_ind])
+            mat = self.system.mass_matrix[-self._n_udep:, -self._n_udep:]
+            rhs = (self.system.forcing[-self._n_udep:, :] -
+                   self.system.mass_matrix[-self._n_udep:, :self._n_uind] * ud_ind)
+            ud_dep_sol = ImmutableMatrix.solve(mat, rhs, "CRAMER")
+            self._eval_ud_dep_via_constraints = lambdify(
+                (t, self.system.q.col_join(self.system.u), ud_ind, self._p),
+                ud_dep_sol[:], cse=True)
         # Fix for https://github.com/numba/numba/issues/3709
         self._eval_eoms_matrices = lambdify(
             (t, self.system.q.col_join(self.system.u), self._p, self._c),
@@ -291,14 +337,12 @@ class Simulator:
         self.solve_initial_conditions()
         self._initialized = True
 
-    # @nb.njit()
     def eval_rhs(self, t: np.float64, x: npt.NDArray[np.float64]
                  ) -> npt.NDArray[np.float64]:
         """Evaluate the right-hand side of the equations of motion."""
         mass_matrix, forcing = self._eval_eoms_reshaped(t, x)
         return np.linalg.solve(mass_matrix, forcing)
 
-    # @nb.njit()
     def _eval_eoms(self, t: float, x: npt.NDArray[np.float64],
                    xd: npt.NDArray[np.float64], residual: npt.NDArray[np.float64]
                    ) -> None:
@@ -310,6 +354,10 @@ class Simulator:
         q_ind, q_dep = q[:self._n_qind], q[self._n_qind:]
         u_ind, u_dep = u[:-self._n_udep], u[-self._n_udep:]
 
+        if self.solve_dependent_speeds_in_dae:
+            xd = np.hstack((xd[:self._n_x - self._n_udep],
+                            self._eval_ud_dep_via_constraints(
+                                t, x, xd[self._n_q:-self._n_udep], self._p_vals)))
         residual[:self._n_x] = mass_matrix @ xd - forcing
         if self._n_qdep != 0:
             residual[self._n_x - self._n_udep:-n_nh] = (
